@@ -36,21 +36,19 @@ You should see one markdown file per research run, e.g. `2026-04-19-fastapi-depe
 
 If you want the brain somewhere else, set `BRAIN_PATH` in `.env` and point Basic Memory at the same path via a named project (see §7).
 
-## 3. Initial Sync
+## 3. Create the Project + Initial Index
 
-Index every markdown file currently in the vault:
-
-```bash
-basic-memory sync
-```
-
-Then run it in watch mode (keeps the index current as new research lands):
+Basic Memory 0.20+ uses named projects. Register `~/basic-memory/` as the default project and build the search index:
 
 ```bash
-basic-memory sync --watch &
+basic-memory project add main ~/basic-memory
+basic-memory project default main
+echo "y" | basic-memory reset --reindex
 ```
 
-(Or run it in a terminal tab / `tmux` / `launchd` — up to you.)
+The `reset --reindex` step drops any stale index state and rebuilds from the markdown files on disk. It also downloads the `bge-small-en-v1.5` embedding model on first run (~90 MB, local, free).
+
+**Ongoing updates happen automatically.** Every CLI research run calls `basic-memory reindex` after writing the new note, so Claude Desktop sees it immediately. To disable this behavior, set `BRAIN_AUTOINDEX=0` in your environment.
 
 ## 4. Wire the MCP Server Into Claude Desktop
 
@@ -97,7 +95,8 @@ Useful verification prompts:
 |---|---|
 | Claude says "no MCP tools available" | Restart Claude Desktop after editing the config. |
 | `uvx: command not found` in Claude logs | Install `uv` (see §1). Claude Desktop inherits your shell PATH only if launched from terminal; otherwise you may need to use an absolute path like `/opt/homebrew/bin/uvx` in the config. |
-| Notes don't appear in search | `basic-memory sync` once, confirm files are indexed, then check `basic-memory doctor`. |
+| Notes don't appear in search | Run `basic-memory reindex` (or `basic-memory reset --reindex` if the DB feels stale), then check `basic-memory doctor`. |
+| Auto-reindex seems to hang | Set `BRAIN_AUTOINDEX=0` in `.env` and reindex manually on your own cadence. |
 | Watch mode stops after reboot | Move it under `launchd` or a process supervisor. Not scripted here — manual for now. |
 
 ## 7. Optional: Custom Vault Path
@@ -112,8 +111,8 @@ BRAIN_PATH=~/work/notes
 Then create a named Basic Memory project pointing there:
 
 ```bash
-basic-memory project create my-brain ~/work/notes
-basic-memory project set-local my-brain
+basic-memory project add my-brain ~/work/notes
+basic-memory project default my-brain
 ```
 
 And update the MCP config to target it:
