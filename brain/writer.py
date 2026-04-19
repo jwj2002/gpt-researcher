@@ -10,7 +10,7 @@ from typing import Iterable
 
 import yaml
 
-DEFAULT_BRAIN_PATH = "~/brain"
+DEFAULT_BRAIN_PATH = "~/basic-memory"
 
 
 def save_research(
@@ -24,7 +24,8 @@ def save_research(
     The file is written to `{BRAIN_PATH}/research/{YYYY-MM-DD}-{slug}.md` with
     YAML frontmatter capturing topic, date, source URLs, source count, and
     (optionally) a config snapshot. The brain path is configurable via the
-    `BRAIN_PATH` environment variable and defaults to `~/brain`.
+    `BRAIN_PATH` environment variable and defaults to `~/basic-memory` (the
+    Basic Memory convention — swap to any directory you like).
 
     Returns the absolute path of the written file.
     """

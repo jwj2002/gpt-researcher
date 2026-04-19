@@ -16,7 +16,7 @@ Fork of `assafelovic/gpt-researcher` adapted into a personal research → knowle
                        └────────┬─────────┘
                                 │  synthesized markdown + sources
                                 ▼
-                   ~/brain/research/*.md      ◀── Basic Memory MCP
+                   ~/basic-memory/research/*.md      ◀── Basic Memory MCP
                                 │                  (queryable via Claude)
                                 ▼
                      ┌─────────────────────┐
@@ -57,25 +57,32 @@ Shipped as PR #4, squashed into `main` at `f30db1ed`. Closed issues #1, #2, #3.
 
 ---
 
-## Phase 2 — Knowledge Store
+## Phase 2 — Knowledge Store (code DONE; user setup pending)
 
 **Goal:** Every research output persists to a queryable second brain.
 
-**Tasks:**
-- Install Basic Memory — `uv tool install basic-memory` or `pip install basic-memory`
-- Point it at `~/brain/` (its default)
-- Add post-research hook in the fork — after `write_report()` completes, write to `~/brain/research/{YYYY-MM-DD}-{slug}.md` with YAML frontmatter (topic, sources, date, status: `draft_ready`)
-- Connect Basic Memory's MCP server to Claude Desktop — `basic-memory mcp`
-- Verify — ask Claude "what have I researched about X?" and get a real answer from the vault
+**Code shipped (this PR):**
+- `brain/` package writes every CLI research run to `~/basic-memory/research/{YYYY-MM-DD}-{slug}.md` with YAML frontmatter (topic, date, sources, source_count, config snapshot).
+- `BRAIN_PATH` env var overrides the default. Default `~/basic-memory/` aligns with Basic Memory's convention so no extra config is needed.
+- Brain save is non-fatal — a failed write prints a warning but doesn't break the CLI.
+
+**User machine setup (your part):**
+Follow `docs/BASIC_MEMORY_SETUP.md`:
+1. `uv tool install basic-memory`
+2. `basic-memory sync --watch &`
+3. Edit `~/Library/Application Support/Claude/claude_desktop_config.json` to register the MCP server
+4. Restart Claude Desktop
+5. Ask Claude: "What have I researched about X?"
 
 **Exit criteria:**
-- [ ] Research auto-stores to `~/brain/research/`
-- [ ] Claude Desktop can search + cite notes from the vault
-- [ ] Frontmatter includes sources so you can trace back
+- [x] Research auto-stores to `~/basic-memory/research/`
+- [ ] Claude Desktop can search + cite notes from the vault *(user setup step)*
+- [x] Frontmatter includes sources so you can trace back
 
 **Notes:**
-- Plain markdown on disk — you can grep, open in any editor, move anywhere
+- Plain markdown on disk — grep, open in any editor, move anywhere
 - Basic Memory rebuilds its index from source files anytime (zero lock-in)
+- The brain is *indexer-agnostic* — works with Obsidian, Logseq, etc. too
 
 ---
 
@@ -177,7 +184,7 @@ Shipped as PR #4, squashed into `main` at `f30db1ed`. Closed issues #1, #2, #3.
   - Generate 3–5 personas per topic (expert, contrarian, novice, practitioner)
   - Simulate writer↔expert turns grounded in retrieved sources
   - Feed transcript into final draft
-- Voice-locking — few-shot layer using your best past posts as style exemplars (store in `~/brain/voice/`)
+- Voice-locking — few-shot layer using your best past posts as style exemplars (store in `~/basic-memory/voice/`)
 - Regenerate-with-notes — text box for critique, second-pass rewrite incorporating feedback
 - Prompt evals — pytest suite that runs known topics through the pipeline, scores output against `docs/baseline/` (Phase 1 baseline is the first reference point)
 
