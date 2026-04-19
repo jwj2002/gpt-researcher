@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable
@@ -11,6 +13,7 @@ from typing import Iterable
 import yaml
 
 DEFAULT_BRAIN_PATH = "~/basic-memory"
+REINDEX_TIMEOUT_SECONDS = 60
 
 
 def save_research(
@@ -18,6 +21,8 @@ def save_research(
     topic: str,
     sources: Iterable[str] = (),
     config: dict | None = None,
+    *,
+    reindex: bool = True,
 ) -> Path:
     """Save a research report to the brain as a dated, slugged markdown file.
 
@@ -26,6 +31,11 @@ def save_research(
     (optionally) a config snapshot. The brain path is configurable via the
     `BRAIN_PATH` environment variable and defaults to `~/basic-memory` (the
     Basic Memory convention — swap to any directory you like).
+
+    When `reindex=True` (the default) and `basic-memory` is on PATH, the
+    function triggers a reindex so the new note is queryable immediately
+    from Claude Desktop via the Basic Memory MCP. Set the env var
+    `BRAIN_AUTOINDEX=0` to disable reindex globally.
 
     Returns the absolute path of the written file.
     """
@@ -51,6 +61,10 @@ def save_research(
         frontmatter_fields, sort_keys=False, default_flow_style=False
     ) + "---"
     path.write_text(f"{frontmatter}\n{report_markdown}\n", encoding="utf-8")
+
+    if reindex and os.getenv("BRAIN_AUTOINDEX", "1") != "0":
+        _reindex_brain()
+
     return path
 
 
@@ -71,3 +85,25 @@ def _unique_path(root: Path, date_str: str, slug: str) -> Path:
         candidate = root / f"{date_str}-{slug}-{counter}.md"
         counter += 1
     return candidate
+
+
+def _reindex_brain() -> None:
+    """Trigger `basic-memory reindex` so new notes are searchable.
+
+    Silent no-op if `basic-memory` isn't installed. Failures are swallowed
+    intentionally — the markdown file is already on disk; a failed reindex
+    just means the note won't surface in Claude Desktop until the next
+    successful index.
+    """
+    bm = shutil.which("basic-memory")
+    if not bm:
+        return
+    try:
+        subprocess.run(
+            [bm, "reindex"],
+            check=False,
+            capture_output=True,
+            timeout=REINDEX_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        pass
