@@ -20,6 +20,7 @@ from gpt_researcher import GPTResearcher
 from gpt_researcher.utils.enum import ReportType, ReportSource, Tone
 from backend.report_type import DetailedReport
 from backend.utils import write_md_to_pdf, write_md_to_word
+from brain import save_research
 
 # =============================================================================
 # CLI
@@ -191,6 +192,38 @@ async def main(args):
     with open(artifact_filepath, "w", encoding="utf-8") as f:
         f.write(report)
     print(f"Report written to '{artifact_filepath}'")
+
+    # Persist to the brain for later search / publishing / chat.
+    # DetailedReport doesn't expose research_sources, so sources are empty
+    # there; single-pass reports pull them from the researcher instance.
+    # We use research_sources (not visited_urls) because it includes both
+    # scraped URLs and retriever-prefetched URLs (e.g. Tavily snippets).
+    try:
+        sources: list[str] = []
+        if args.report_type != 'detailed_report':
+            sources = sorted({
+                s.get("url") or s.get("href")
+                for s in researcher.get_research_sources()
+                if s.get("url") or s.get("href")
+            })
+        brain_path = save_research(
+            report_markdown=report,
+            topic=args.query,
+            sources=sources,
+            config={
+                "smart_llm": os.getenv("SMART_LLM", ""),
+                "fast_llm": os.getenv("FAST_LLM", ""),
+                "strategic_llm": os.getenv("STRATEGIC_LLM", ""),
+                "embedding": os.getenv("EMBEDDING", ""),
+                "retriever": os.getenv("RETRIEVER", ""),
+                "report_type": args.report_type,
+                "tone": args.tone,
+            },
+        )
+        print(f"Saved to brain: {brain_path}")
+    except Exception as e:
+        # Brain save is non-fatal — CLI should still finish successfully.
+        print(f"Warning: brain save failed: {e}")
 
     # Generate PDF if not disabled
     if not args.no_pdf:
