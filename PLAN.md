@@ -32,28 +32,28 @@ Fork of `assafelovic/gpt-researcher` adapted into a personal research → knowle
 
 ---
 
-## Phase 1 — Foundation
+## Phase 1 — Foundation ✅ DONE (2026-04-19)
 
-**Goal:** Clean fork, runs locally, produces a research report end-to-end.
+Shipped as PR #4, squashed into `main` at `f30db1ed`. Closed issues #1, #2, #3.
 
-**Tasks:**
-- Remove sprawl — delete `multi_agents_ag2/`, `mcp-server/` (don't need these)
-- Keep — `gpt_researcher/`, `backend/`, `multi_agents/`, `frontend/`, `docs/`
-- Set up `.env` with `OPENAI_API_KEY`, `TAVILY_API_KEY`
-- Install deps — `pip install -r requirements.txt` (use venv or uv)
-- Smoke test — run one query via CLI, confirm markdown output
-- Commit the cleanup — `chore: remove unused parallel agent implementations`
+**What shipped:**
+- Removed `multi_agents_ag2/` and `mcp-server/` (sprawl)
+- Pinned `langchain-anthropic>=1.4` and `langchain-huggingface` + `sentence-transformers` in `requirements.txt`
+- This `PLAN.md`
+- First baseline research artifact at `docs/baseline/mcp-adoption-2026.md`
 
-**Exit criteria:**
-- [ ] `python cli.py "<some topic>"` produces a markdown report
-- [ ] Repo runs without the deleted directories
-- [ ] First commit on the fork
+**Learnings that change downstream phases:**
 
-**Files to open first:**
+1. **`claude-opus-4-7` rejects the `temperature` parameter** — extended-thinking models don't accept it. All three LLM tiers currently use `claude-sonnet-4-6`. Revisit in Phase 6 with per-model overrides or the thinking-mode API.
+2. **Voyage AI free tier is theater** — 3 RPM without a payment method, unusable for agent workflows. Using local HuggingFace `all-MiniLM-L6-v2`. Voyage can return when a card is added (200M tokens/mo become genuinely free then).
+3. **gpt-researcher silently hallucinates on empty retrieval** — if sub-query search returns 0 real sources, the writer stage fabricates citations from training data. Guard added to Phase 3 acceptance.
+
+**Files to open first (still useful for later phases):**
 - `gpt_researcher/agent.py` — the orchestrator
 - `gpt_researcher/prompts.py` — where quality lives
 - `gpt_researcher/config/variables/default.py` — the knobs
 - `backend/server/server.py` — the API surface
+- `gpt_researcher/skills/researcher.py` — search + scrape pipeline
 
 ---
 
@@ -85,20 +85,30 @@ Fork of `assafelovic/gpt-researcher` adapted into a personal research → knowle
 
 **Tasks:**
 - Add `queue` module to the backend (alongside `backend/server/`)
-- SQLite table — `(id, topic, style, status, draft_md, sources_json, destination, created_at, scheduled_for)`
-- Statuses: `pending → researching → draft_ready → approved → published`
+- SQLite table — `(id, topic, style, status, draft_md, sources_json, source_count, destination, created_at, scheduled_for)`
+- Statuses: `pending → researching → draft_ready → flagged → approved → published`
+  - `flagged` = draft produced but `source_count` below threshold (likely hallucinated)
 - Routes: `POST /queue` (submit topic), `GET /queue` (list), `GET /queue/{id}`, `PUT /queue/{id}`, `POST /queue/{id}/approve`
-- React page — list view, detail/edit view, regenerate button, approve button
+- React page — list view, detail/edit view, regenerate button, approve button, **hallucination warning banner on flagged drafts**
 - Wire "submit" → kicks off research asynchronously → updates status when done
+
+**Hallucination guard (new — from Phase 1 learning):**
+- After research completes, count unique real URLs cited in the draft
+- If `source_count < 3` (tunable), set status to `flagged` instead of `draft_ready`
+- Approve button for `flagged` drafts requires an explicit override ("I verified the content manually")
+- Store the sources JSON with the draft so the reviewer can spot-check provenance in the UI
 
 **Exit criteria:**
 - [ ] Submit a topic from the UI, see it move through statuses
 - [ ] Edit a draft inline, save changes
+- [ ] Drafts with <3 real sources land as `flagged`, not `draft_ready`
+- [ ] Flagged drafts show a visible warning in the UI with linked sources
 - [ ] Approve a draft (for now, approval just sets status — publishing comes in Phase 5)
 
 **Decision needed before starting:**
 - SQLite or Postgres? → Start SQLite, upgrade later if needed.
 - React or reuse the existing Next.js frontend? → Reuse if possible (less code), new if the queue UI doesn't fit.
+- Minimum source count threshold (suggested: 3).
 
 ---
 
@@ -158,6 +168,10 @@ Fork of `assafelovic/gpt-researcher` adapted into a personal research → knowle
 
 **Tasks (pick from these as needed):**
 
+**Reliability debt from Phase 1:**
+- Per-model temperature handling — thinking models (e.g. `claude-opus-4-7`) need `temperature` *omitted entirely*, not set to any value. Add a wrapper or patch `gpt_researcher/utils/llm.py` to detect model family and strip the param when appropriate. Restores opus for `STRATEGIC_LLM`.
+- Hallucination regression test — when retrieval returns 0 real sources, the writer should refuse to produce a report rather than fall back to training data. Add as a failing test first, then fix. Consider PR upstream if the fix lands cleanly.
+
 **Quality:**
 - Port STORM's multi-persona conversation as a new `skills/personas.py` module
   - Generate 3–5 personas per topic (expert, contrarian, novice, practitioner)
@@ -165,7 +179,7 @@ Fork of `assafelovic/gpt-researcher` adapted into a personal research → knowle
   - Feed transcript into final draft
 - Voice-locking — few-shot layer using your best past posts as style exemplars (store in `~/brain/voice/`)
 - Regenerate-with-notes — text box for critique, second-pass rewrite incorporating feedback
-- Prompt evals — add a small pytest suite that runs known topics through the pipeline, scores output against rubric
+- Prompt evals — pytest suite that runs known topics through the pipeline, scores output against `docs/baseline/` (Phase 1 baseline is the first reference point)
 
 **Chat (optional):**
 - Already works for free via Claude Desktop + Basic Memory MCP — use that first
@@ -207,6 +221,9 @@ Track these as they come up:
 - [ ] React frontend approach — reuse gpt-researcher's Next.js app or add new (Phase 3)
 - [ ] First 3–5 styles content (Phase 4 blocker — decide before writing prompts)
 - [ ] Typefully vs Buffer (Phase 5)
+- [ ] Minimum source count for draft approval (Phase 3 — suggested: 3)
+- [ ] Voyage embeddings — pay for the card + get 200M free tokens, or stay on local HuggingFace (any phase)
+- [ ] PR hallucination-refusal fix upstream to gpt-researcher, or keep as local patch (Phase 6)
 
 ## Sequencing Discipline
 
