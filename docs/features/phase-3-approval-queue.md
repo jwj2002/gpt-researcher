@@ -1,6 +1,6 @@
 ---
 title: Phase 3 — Approval Queue
-status: draft
+status: ready
 created: 2026-04-19
 author: jwj2002
 type: Fullstack
@@ -86,31 +86,37 @@ A draft review workflow between research and publishing. Topics submitted via a 
 ```
 backend/queue/
 ├── __init__.py
-├── models.py        # SQLModel tables + enum
-├── schemas.py       # Pydantic request/response models
+├── database.py      # async engine, session factory, DeclarativeBase
+├── models.py        # SQLAlchemy 2.0 ORM models + DraftStatus enum
+├── schemas.py       # Pydantic request/response models (separate from ORM)
+├── mappers.py       # orm_to_response, parse sources_json, etc.
+├── repository.py    # CRUD using AsyncSession
 ├── service.py       # orchestration: submit, transition, regenerate
-├── repository.py    # CRUD on QueueItem
-├── router.py        # /queue routes
+├── router.py        # FastAPI /queue routes
 ├── tasks.py         # BackgroundTasks entry: run_research(queue_item_id)
 └── exceptions.py    # QueueError, InvalidStateTransition, NotFoundError
 ```
 
-Pattern mirrors layered-architecture convention (repository → service → router). No existing backend module in this fork uses this pattern yet, so this establishes it for Phase 3+ work.
+Pattern mirrors layered-architecture convention (repository → service → router). No existing backend module in this fork uses this pattern yet, so this establishes it for Phase 3+ work. Pydantic schemas are kept separate from ORM models — two class sets, explicit mappers between them.
 
 ### Database
 
-- **Engine:** SQLite via SQLModel (async `sqlite+aiosqlite://`)
+- **Engine:** SQLAlchemy 2.0 async (`sqlite+aiosqlite://`)
 - **File:** `${BRAIN_PATH}/queue.db` (lives alongside the vault)
-- **Schema bootstrap:** `SQLModel.metadata.create_all(engine)` on server startup. No Alembic yet.
+- **Schema bootstrap:** `Base.metadata.create_all(engine)` on server startup. No Alembic yet — add when the schema evolves past Phase 3.
 
-### Model: `QueueItem`
+### ORM: `QueueItem` (SQLAlchemy 2.0 declarative)
 
 ```python
 # backend/queue/models.py
 from datetime import datetime
 from enum import Enum
 from uuid import uuid4
-from sqlmodel import SQLModel, Field
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    pass
 
 
 class DraftStatus(str, Enum):
@@ -123,23 +129,93 @@ class DraftStatus(str, Enum):
     FAILED       = "failed"         # research errored out
 
 
-class QueueItem(SQLModel, table=True):
+class QueueItem(Base):
     __tablename__ = "queue_items"
 
-    id: str = Field(default_factory=lambda: str(uuid4()), primary_key=True)
+    id:             Mapped[str]          = mapped_column(primary_key=True, default=lambda: str(uuid4()))
+    topic:          Mapped[str]
+    style:          Mapped[str | None]   = mapped_column(default=None)   # free-form in Phase 3; enum in Phase 4
+    destination:    Mapped[str | None]   = mapped_column(default=None)   # free-form in Phase 3; enum in Phase 5
+    status:         Mapped[DraftStatus]  = mapped_column(default=DraftStatus.PENDING, index=True)
+
+    draft_md:       Mapped[str | None]   = mapped_column(default=None)
+    sources_json:   Mapped[str | None]   = mapped_column(default=None)    # JSON-encoded list[str] of URLs
+    source_count:   Mapped[int]          = mapped_column(default=0)
+    brain_path:     Mapped[str | None]   = mapped_column(default=None)    # absolute path on disk for traceback
+    error_message:  Mapped[str | None]   = mapped_column(default=None)    # populated only when status == failed
+
+    created_at:     Mapped[datetime]     = mapped_column(default=datetime.utcnow)
+    updated_at:     Mapped[datetime]     = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
+```
+
+### Pydantic Schemas (separate from ORM)
+
+```python
+# backend/queue/schemas.py
+from datetime import datetime
+from pydantic import BaseModel, ConfigDict
+from .models import DraftStatus
+
+
+class QueueItemCreate(BaseModel):
     topic: str
-    style: str | None = None              # free-form in Phase 3; enum in Phase 4
-    destination: str | None = None        # free-form in Phase 3; enum in Phase 5
-    status: DraftStatus = DraftStatus.PENDING
+    style: str | None = None
+    destination: str | None = None
 
+
+class QueueItemUpdate(BaseModel):
     draft_md: str | None = None
-    sources_json: str | None = None       # JSON-encoded list[str] of URLs
-    source_count: int = 0
-    brain_path: str | None = None         # absolute path on disk for traceback
-    error_message: str | None = None      # populated only when status == failed
+    style: str | None = None
+    destination: str | None = None
 
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class ApproveRequest(BaseModel):
+    override: bool = False
+
+
+class QueueItemResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    topic: str
+    style: str | None
+    destination: str | None
+    status: DraftStatus
+    draft_md: str | None
+    sources: list[str]                  # parsed from sources_json via mapper
+    source_count: int
+    brain_path: str | None
+    error_message: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class StatsResponse(BaseModel):
+    pending: int
+    researching: int
+    draft_ready: int
+    flagged: int
+    approved: int
+    rejected: int
+    failed: int
+```
+
+### Mapper
+
+`sources_json` is a TEXT column; `sources` in the response is a list. Conversion lives in `mappers.py`:
+
+```python
+# backend/queue/mappers.py
+import json
+from .models import QueueItem
+from .schemas import QueueItemResponse
+
+
+def to_response(item: QueueItem) -> QueueItemResponse:
+    return QueueItemResponse(
+        **{k: getattr(item, k) for k in QueueItemResponse.model_fields if k != "sources"},
+        sources=json.loads(item.sources_json) if item.sources_json else [],
+    )
 ```
 
 ⚠️ **ENUM_VALUE VALUES (these are what the frontend sees):**
@@ -153,13 +229,13 @@ Frontend MUST use the string values, not the Python names (`DraftStatus.PENDING`
 | From → To          | Trigger                               | Notes |
 |---|---|---|
 | pending → researching | BackgroundTasks picks up the job | Automatic |
-| researching → draft_ready | Research completes, source_count ≥ threshold | |
-| researching → flagged | Research completes, source_count < threshold | |
+| researching → draft_ready | Research completes, source_count ≥ `HALLUCINATION_MIN_SOURCES` | Default threshold 3 |
+| researching → flagged | Research completes, source_count < threshold | Hallucination guard |
 | researching → failed | Research raises | `error_message` populated |
 | draft_ready → approved | POST /approve | No override needed |
-| flagged → approved | POST /approve with `override=true` | 400 without override |
-| draft_ready / flagged → rejected | POST /reject | Terminal |
-| any → pending (regenerate) | POST /regenerate | Clears draft fields; re-schedules research |
+| flagged → approved | POST /approve with `override=true` | 409 without override |
+| draft_ready / flagged → rejected | POST /reject | **Terminal** — retry = new submission |
+| draft_ready / flagged / failed → pending (regenerate) | POST /regenerate | Clears draft fields; re-schedules research. **Not allowed from rejected.** |
 
 Invalid transitions raise `InvalidStateTransition` → 409 Conflict.
 
@@ -169,11 +245,12 @@ Invalid transitions raise `InvalidStateTransition` → 409 Conflict.
 |---|---|---|---|
 | POST | `/queue` | Submit new topic; returns created item with `status=pending` | 201, 422 |
 | GET | `/queue` | List items; optional `?status=` filter | 200 |
-| GET | `/queue/{id}` | Full item including `draft_md` and `sources_json` | 200, 404 |
+| GET | `/queue/stats` | Counts by status: `{pending, researching, draft_ready, flagged, approved, rejected, failed}` | 200 |
+| GET | `/queue/{id}` | Full item including `draft_md` and `sources` | 200, 404 |
 | PUT | `/queue/{id}` | Edit `draft_md` only (and `style`/`destination`). Allowed when status ∈ {draft_ready, flagged, approved}. | 200, 404, 409 |
 | POST | `/queue/{id}/approve` | Transition to approved. Body: `{override?: bool}`. Required if status=flagged. | 200, 404, 409 |
-| POST | `/queue/{id}/reject` | Transition to rejected. | 200, 404, 409 |
-| POST | `/queue/{id}/regenerate` | Reset and re-run research. | 202, 404 |
+| POST | `/queue/{id}/reject` | Transition to rejected (terminal — retry = new submission). | 200, 404, 409 |
+| POST | `/queue/{id}/regenerate` | Reset and re-run research. Not allowed from `rejected`. | 202, 404, 409 |
 | WS | `/queue/stream` | Subscribe to status-change events. Messages: `{type: "queue_update", id, status}`. | — |
 
 ### Request/Response Shapes
@@ -207,6 +284,8 @@ Invalid transitions raise `InvalidStateTransition` → 409 Conflict.
 
 ### Hallucination Guard Implementation
 
+**Threshold:** `HALLUCINATION_MIN_SOURCES=3` by default, tunable via env var. Lower = more liberal (fewer flags); higher = stricter.
+
 ```python
 # backend/queue/service.py (fragment)
 HALLUCINATION_MIN_SOURCES = int(os.getenv("HALLUCINATION_MIN_SOURCES", "3"))
@@ -222,6 +301,8 @@ On `POST /queue/{id}/approve`:
 if item.status == DraftStatus.FLAGGED and not payload.override:
     raise HTTPException(409, "Flagged drafts require override=true")
 ```
+
+Rationale from Phase 1: the hallucination failure mode produced a draft with **0 real sources** (fabricated citations). Any threshold ≥ 1 catches the pure-hallucination case; `3` additionally catches thin-retrieval drafts where the research returned too little material to be trustworthy.
 
 ### Background Research Task
 
@@ -358,6 +439,12 @@ Queue writes to two places per approval: the SQLite `queue_items` table AND the 
 
 Single-user, single-process — race conditions unlikely. SQLite with `aiosqlite` serializes writes at the DB level. Defer connection pool tuning to if/when we go multi-user.
 
+### Auth Model (Phase 3)
+
+Server binds to `127.0.0.1:8000` — no token, no session, no password. Rationale: the queue never publishes externally in Phase 3; worst case a rogue local process approves a draft that sits in the queue, nothing escapes.
+
+**Upgrade plan (Phase 5):** when publishing adapters go live, add a static bearer token via `QUEUE_API_TOKEN` env var and `Authorization: Bearer {token}` on all requests. Frontend pulls the token from build-time env. That's when any URL Phase 5 exposes becomes a real attack surface.
+
 ## Acceptance Criteria
 
 - [ ] `POST /queue` with `{topic}` returns 201 and a QueueItem with `status=pending`
@@ -375,14 +462,16 @@ Single-user, single-process — race conditions unlikely. SQLite with `aiosqlite
 - [ ] Existing CLI (`python cli.py ...`) still works unchanged
 - [ ] Approved drafts remain queryable in Claude Desktop via Basic Memory
 
-## Open Questions
+## Resolved Decisions
 
-1. **ORM choice:** SQLModel or raw SQLAlchemy 2.0? Draft assumes SQLModel (lighter boilerplate). **Confirm.**
-2. **Hallucination threshold default:** 3 sources. **Confirm, or pick a different number after looking at the existing baseline.**
-3. **Should submission via the queue *replace* the CLI writing to the brain, or coexist?** Draft says both continue to write to the brain via the same `save_research()` function — a CLI run and a queue run are indistinguishable from the brain's perspective. **Confirm.**
-4. **Do we want a `/queue/stats` endpoint?** Handy for a future dashboard (counts by status). Not needed for Phase 3 MVP — include as a stretch goal?
-5. **Rejection — is it truly terminal, or should there be a "duplicate of rejected item" concept?** Draft makes it terminal; regenerate from rejected would require a new queue item.
-6. **Auth:** bind server to `127.0.0.1` and call it done for Phase 3, add token auth in Phase 5 when published content becomes visible outside the machine. **Confirm.**
+All pre-implementation questions have been answered. Decisions captured here for traceability — each one is reflected in the sections above.
+
+1. **ORM:** Raw SQLAlchemy 2.0 + separate Pydantic schemas. Two class sets with explicit mappers. Reflected in `backend/queue/` module layout, model fragment, schema fragment.
+2. **Hallucination threshold:** `HALLUCINATION_MIN_SOURCES=3`, tunable via env var.
+3. **CLI + queue coexist.** Both call `save_research()`; the brain is identical regardless of source. CLI is not rewritten.
+4. **`GET /queue/stats` included** — returns a dict of counts per status.
+5. **Rejection is terminal.** Retry = submit a new queue item. Regenerate endpoint explicitly refuses `rejected` items.
+6. **Auth Phase 3:** bind to `127.0.0.1`, no auth. Upgrade to `QUEUE_API_TOKEN` bearer token in Phase 5 when publishing adapters go live.
 
 ## Completeness
 
@@ -395,14 +484,13 @@ Single-user, single-process — race conditions unlikely. SQLite with `aiosqlite
 | API contract (request/response shapes) | ✅ Complete |
 | Risk flags | ✅ Complete |
 | Acceptance criteria | ✅ 13 items |
-| Open questions | ✅ 6 items |
+| Decisions resolved | ✅ All 6 pre-implementation questions answered |
 
-Spec is **~90% complete**. The [TODO] items are intentional — they're questions to answer by reading `frontend/nextjs/components/` during implementation, not decisions to make at spec time.
+Spec is **ready for `/spec-review`**. The remaining [TODO] items are intentional — they're questions to answer by reading `frontend/nextjs/components/` during implementation, not decisions to make at spec time.
 
 ---
 
 **Next Steps:**
-1. Review this spec (especially Open Questions)
-2. Resolve Open Questions → update inline or in a follow-up commit
-3. Run `/spec-review docs/features/phase-3-approval-queue.md` to generate GitHub issues
-4. `/orchestrate <issue-number>` per issue
+1. `/spec-review docs/features/phase-3-approval-queue.md` — generates GitHub issues per section (expect ~5–7 issues: DB setup, models+schemas, routes, state machine + guard, background task, frontend pages, frontend components)
+2. `/orchestrate <issue-number>` per issue
+3. Independent issues can run in parallel (`--parallel` flag)
