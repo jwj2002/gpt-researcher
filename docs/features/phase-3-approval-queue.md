@@ -53,30 +53,49 @@ A draft review workflow between research and publishing. Topics submitted via a 
         ▼
    POST /queue           ───┐
    ← { id, status: pending } │    (validates, inserts QueueItem,
-                              │     schedules BackgroundTasks.run_research)
+                              │     schedules BackgroundTasks →
+                              │     process_queue_item(id, real_runner))
         │                    │
         ▼                    │
    List / Detail pages       │
-   ← polls or WS subscribes  │
+   ← refetch on connect,     │
+     invalidate on WS delta  │
                              │
-   BackgroundTasks.run_research(id):
-     1. UPDATE status = researching
-     2. await GPTResearcher.conduct_research() + write_report()
-     3. save_research() to ~/basic-memory/research/   (existing Phase 2 path)
-     4. UPDATE:
-          - draft_md, sources_json, source_count, brain_path
+   service.process_queue_item(id, runner):
+     1. Load item; if missing, log + return
+     2. Compare-and-set: status = researching,
+                         active_run_id = new UUID,
+                         research_started_at = now
+     3. result = await runner.run(topic, style, ...)
+     4. Re-load; if active_run_id has changed, discard (a newer
+        regenerate superseded this run)
+     5. UPDATE:
+          - draft_md, sources_json, source_count
           - status = draft_ready  (if source_count >= threshold)
                      flagged       (if < threshold)
                      failed        (on exception)
-     5. websocket broadcast { type: "queue_update", id, status }
+        NOTE: brain is NOT written here. Brain save happens only
+              on POST /approve (Option A).
+     6. websocket broadcast { type: "queue_update", id, status,
+                              updated_at }
 
    Review Page (Next.js /queue/[id])
         │
         ▼
-   PUT /queue/{id}      — inline markdown edit
-   POST .../approve     — override required if status=flagged
-   POST .../reject      — terminal
-   POST .../regenerate  — reset to pending + re-schedule research
+   PUT /queue/{id}      — inline markdown edit (draft_ready / flagged only;
+                           approved items are IMMUTABLE)
+   POST .../approve     — override required if status=flagged;
+                           writes to brain via save_research();
+                           sets approved_at
+   POST .../reject      — terminal; brain never written
+   POST .../regenerate  — atomic: mints new active_run_id,
+                           resets to pending, rejects if status ∈
+                           {pending, researching, rejected}
+
+   Server startup:
+     Reconcile any item left in `researching` older than
+     RECONCILE_TIMEOUT (default 10 min) → mark failed with
+     error_message = "reconciled after server restart"
 ```
 
 ## Backend Specification
@@ -86,15 +105,17 @@ A draft review workflow between research and publishing. Topics submitted via a 
 ```
 backend/queue/
 ├── __init__.py
-├── database.py      # async engine, session factory, DeclarativeBase
-├── models.py        # SQLAlchemy 2.0 ORM models + DraftStatus enum
-├── schemas.py       # Pydantic request/response models (separate from ORM)
-├── mappers.py       # orm_to_response, parse sources_json, etc.
-├── repository.py    # CRUD using AsyncSession
-├── service.py       # orchestration: submit, transition, regenerate
-├── router.py        # FastAPI /queue routes
-├── tasks.py         # BackgroundTasks entry: run_research(queue_item_id)
-└── exceptions.py    # QueueError, InvalidStateTransition, NotFoundError
+├── database.py       # async engine, session factory, DeclarativeBase
+├── models.py         # SQLAlchemy 2.0 ORM models + DraftStatus enum
+├── schemas.py        # Pydantic request/response models (separate from ORM)
+├── mappers.py        # orm_to_response, parse sources_json, etc.
+├── repository.py     # CRUD using AsyncSession
+├── runners.py        # ResearchRunner protocol + GPTResearcherRunner impl
+├── service.py        # process_queue_item(id, runner) + transitions
+├── reconciliation.py # startup scan for stale `researching` items
+├── router.py         # FastAPI /queue routes
+├── tasks.py          # thin BackgroundTasks adapter → service.process_queue_item
+└── exceptions.py     # QueueError, InvalidStateTransition, NotFoundError
 ```
 
 Pattern mirrors layered-architecture convention (repository → service → router). No existing backend module in this fork uses this pattern yet, so this establishes it for Phase 3+ work. Pydantic schemas are kept separate from ORM models — two class sets, explicit mappers between them.
@@ -132,20 +153,26 @@ class DraftStatus(str, Enum):
 class QueueItem(Base):
     __tablename__ = "queue_items"
 
-    id:             Mapped[str]          = mapped_column(primary_key=True, default=lambda: str(uuid4()))
-    topic:          Mapped[str]
-    style:          Mapped[str | None]   = mapped_column(default=None)   # free-form in Phase 3; enum in Phase 4
-    destination:    Mapped[str | None]   = mapped_column(default=None)   # free-form in Phase 3; enum in Phase 5
-    status:         Mapped[DraftStatus]  = mapped_column(default=DraftStatus.PENDING, index=True)
+    id:                   Mapped[str]             = mapped_column(primary_key=True, default=lambda: str(uuid4()))
+    topic:                Mapped[str]
+    style:                Mapped[str | None]      = mapped_column(default=None)      # free-form in Phase 3; enum in Phase 4
+    destination:          Mapped[str | None]      = mapped_column(default=None)      # free-form in Phase 3; enum in Phase 5
+    status:               Mapped[DraftStatus]     = mapped_column(default=DraftStatus.PENDING, index=True)
 
-    draft_md:       Mapped[str | None]   = mapped_column(default=None)
-    sources_json:   Mapped[str | None]   = mapped_column(default=None)    # JSON-encoded list[str] of URLs
-    source_count:   Mapped[int]          = mapped_column(default=0)
-    brain_path:     Mapped[str | None]   = mapped_column(default=None)    # absolute path on disk for traceback
-    error_message:  Mapped[str | None]   = mapped_column(default=None)    # populated only when status == failed
+    draft_md:             Mapped[str | None]      = mapped_column(default=None)
+    sources_json:         Mapped[str | None]      = mapped_column(default=None)       # JSON-encoded list[str] of URLs
+    source_count:         Mapped[int]             = mapped_column(default=0)
+    brain_path:           Mapped[str | None]      = mapped_column(default=None)       # populated only on approval
+    error_message:        Mapped[str | None]      = mapped_column(default=None)       # populated only when status == failed
 
-    created_at:     Mapped[datetime]     = mapped_column(default=datetime.utcnow)
-    updated_at:     Mapped[datetime]     = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
+    # Durability + concurrency (added per spec review findings #1 and #5)
+    active_run_id:        Mapped[str | None]      = mapped_column(default=None)       # UUID of the current research run; used for CAS on regenerate
+    research_started_at:  Mapped[datetime | None] = mapped_column(default=None)       # used by startup reconciliation
+    approved_at:          Mapped[datetime | None] = mapped_column(default=None)       # set by POST /approve
+    approved_with_override: Mapped[bool]          = mapped_column(default=False)      # true if approved from `flagged`
+
+    created_at:           Mapped[datetime]        = mapped_column(default=datetime.utcnow)
+    updated_at:           Mapped[datetime]        = mapped_column(default=datetime.utcnow, onupdate=datetime.utcnow)
 ```
 
 ### Pydantic Schemas (separate from ORM)
@@ -184,8 +211,10 @@ class QueueItemResponse(BaseModel):
     draft_md: str | None
     sources: list[str]                  # parsed from sources_json via mapper
     source_count: int
-    brain_path: str | None
+    brain_path: str | None              # populated only when status >= approved
     error_message: str | None
+    approved_at: datetime | None
+    approved_with_override: bool
     created_at: datetime
     updated_at: datetime
 
@@ -228,14 +257,19 @@ Frontend MUST use the string values, not the Python names (`DraftStatus.PENDING`
 
 | From → To          | Trigger                               | Notes |
 |---|---|---|
-| pending → researching | BackgroundTasks picks up the job | Automatic |
+| pending → researching | BackgroundTasks picks up the job | Sets `active_run_id`, `research_started_at` |
 | researching → draft_ready | Research completes, source_count ≥ `HALLUCINATION_MIN_SOURCES` | Default threshold 3 |
 | researching → flagged | Research completes, source_count < threshold | Hallucination guard |
-| researching → failed | Research raises | `error_message` populated |
-| draft_ready → approved | POST /approve | No override needed |
-| flagged → approved | POST /approve with `override=true` | 409 without override |
-| draft_ready / flagged → rejected | POST /reject | **Terminal** — retry = new submission |
-| draft_ready / flagged / failed → pending (regenerate) | POST /regenerate | Clears draft fields; re-schedules research. **Not allowed from rejected.** |
+| researching → failed | Research raises, OR startup reconciliation marks stale | `error_message` populated |
+| draft_ready → approved | POST /approve | No override needed; writes to brain |
+| flagged → approved | POST /approve with `override=true` | 409 without override; writes to brain; sets `approved_with_override=true` |
+| draft_ready / flagged → rejected | POST /reject | **Terminal** — retry = new submission; brain never written |
+| draft_ready / flagged / failed → pending (regenerate) | POST /regenerate | Compare-and-set: mints new `active_run_id`, clears draft fields, re-schedules. **Not allowed from pending, researching, approved, or rejected.** |
+
+**Invariants:**
+- **Approved is immutable.** No `PUT /queue/{id}` is allowed when `status == approved`. To amend approved content, create a new queue item with the corrected topic/draft and re-approve.
+- **Only one active run per item.** `active_run_id` is updated atomically on regenerate; in-flight runs check their run ID before committing their result and discard if superseded.
+- **Brain is written exactly once per approved item.** If `brain_path` is non-null, don't overwrite.
 
 Invalid transitions raise `InvalidStateTransition` → 409 Conflict.
 
@@ -244,14 +278,14 @@ Invalid transitions raise `InvalidStateTransition` → 409 Conflict.
 | Method | Path | Purpose | Status codes |
 |---|---|---|---|
 | POST | `/queue` | Submit new topic; returns created item with `status=pending` | 201, 422 |
-| GET | `/queue` | List items; optional `?status=` filter | 200 |
+| GET | `/queue` | List items; optional `?status=` filter. Clients MUST call this on WS (re)connect to sync state. | 200 |
 | GET | `/queue/stats` | Counts by status: `{pending, researching, draft_ready, flagged, approved, rejected, failed}` | 200 |
 | GET | `/queue/{id}` | Full item including `draft_md` and `sources` | 200, 404 |
-| PUT | `/queue/{id}` | Edit `draft_md` only (and `style`/`destination`). Allowed when status ∈ {draft_ready, flagged, approved}. | 200, 404, 409 |
-| POST | `/queue/{id}/approve` | Transition to approved. Body: `{override?: bool}`. Required if status=flagged. | 200, 404, 409 |
-| POST | `/queue/{id}/reject` | Transition to rejected (terminal — retry = new submission). | 200, 404, 409 |
-| POST | `/queue/{id}/regenerate` | Reset and re-run research. Not allowed from `rejected`. | 202, 404, 409 |
-| WS | `/queue/stream` | Subscribe to status-change events. Messages: `{type: "queue_update", id, status}`. | — |
+| PUT | `/queue/{id}` | Edit `draft_md` / `style` / `destination`. **Allowed only when status ∈ {draft_ready, flagged}** — approved drafts are immutable. | 200, 404, 409 |
+| POST | `/queue/{id}/approve` | Transition to approved. Body: `{override?: bool}`. Required if status=flagged. Writes to brain via `save_research()`; sets `approved_at`. | 200, 404, 409 |
+| POST | `/queue/{id}/reject` | Transition to rejected (terminal — retry = new submission). Brain never written. | 200, 404, 409 |
+| POST | `/queue/{id}/regenerate` | Atomic reset: mints new `active_run_id`, clears draft fields, re-schedules research. Allowed from {draft_ready, flagged, failed}. | 202, 404, 409 |
+| WS | `/queue/stream` | Subscribe to status-change deltas. Messages: `{type: "queue_update", id, status, updated_at}`. Delta stream only; clients refetch via GET on (re)connect. | — |
 
 ### Request/Response Shapes
 
@@ -278,9 +312,19 @@ Invalid transitions raise `InvalidStateTransition` → 409 Conflict.
 // POST /queue/{id}/approve  body
 { override?: boolean }               // defaults to false
 
-// WS /queue/stream  server → client
-{ type: "queue_update", id: string, status: string }
+// WS /queue/stream  server → client (delta only)
+{ type: "queue_update", id: string, status: string, updated_at: string }
 ```
+
+### WebSocket Reconnection Contract
+
+The WS stream is a **delta** feed only — no snapshot on connect, no replay of missed events. The reconnection contract is:
+
+1. On WS connect (including reconnect), the client MUST call `GET /queue` (and `GET /queue/{id}` if a detail page is open) to sync state.
+2. The client then processes deltas, using `updated_at` to detect out-of-order delivery.
+3. If `updated_at` in a delta is older than the locally cached `updated_at` for that item, discard the delta.
+
+This keeps the server simple (no snapshot builder, no replay buffer) and shifts correctness to the client, which already needs refetch-on-focus for other reasons.
 
 ### Hallucination Guard Implementation
 
@@ -304,44 +348,170 @@ if item.status == DraftStatus.FLAGGED and not payload.override:
 
 Rationale from Phase 1: the hallucination failure mode produced a draft with **0 real sources** (fabricated citations). Any threshold ≥ 1 catches the pure-hallucination case; `3` additionally catches thin-retrieval drafts where the research returned too little material to be trustworthy.
 
-### Background Research Task
+### Research Runner Protocol (test seam — fix for finding #8)
 
 ```python
-# backend/queue/tasks.py (fragment)
-async def run_research(item_id: str) -> None:
-    try:
-        item = await repository.get(item_id)
-        item.status = DraftStatus.RESEARCHING
-        await repository.save(item)
+# backend/queue/runners.py
+from typing import Protocol
+from dataclasses import dataclass
 
-        researcher = GPTResearcher(query=item.topic, ...)
+
+@dataclass(frozen=True)
+class ResearchResult:
+    report_markdown: str
+    sources: list[str]   # unique, ordered
+
+
+class ResearchRunner(Protocol):
+    async def run(self, topic: str, *, style: str | None = None) -> ResearchResult: ...
+
+
+class GPTResearcherRunner:
+    """Production runner — wraps gpt-researcher."""
+
+    async def run(self, topic: str, *, style: str | None = None) -> ResearchResult:
+        researcher = GPTResearcher(query=topic, ...)  # style → prompt mapping comes in Phase 4
         await researcher.conduct_research()
         report = await researcher.write_report()
-
-        sources = sorted({s.get("url") or s.get("href")
-                          for s in researcher.get_research_sources()
-                          if s.get("url") or s.get("href")})
-
-        brain_path = save_research(
-            report_markdown=report, topic=item.topic, sources=sources,
-            config=_config_snapshot(item),
-        )
-
-        item.draft_md = report
-        item.sources_json = json.dumps(sources)
-        item.source_count = len(sources)
-        item.brain_path = str(brain_path)
-        item.status = classify_draft(len(sources))
-    except Exception as e:
-        item.status = DraftStatus.FAILED
-        item.error_message = str(e)
-    finally:
-        item.updated_at = datetime.utcnow()
-        await repository.save(item)
-        await websocket_manager.broadcast_queue_update(item.id, item.status)
+        sources = sorted({
+            (s.get("url") or s.get("href"))
+            for s in researcher.get_research_sources()
+            if s.get("url") or s.get("href")
+        })
+        return ResearchResult(report_markdown=report, sources=list(sources))
 ```
 
-Note: `except Exception` here is a defensive boundary — we MUST NOT let a research crash kill the whole process. The exception is captured into `error_message` and surfaced via the `failed` status.
+### Service Orchestration (fix for findings #1, #2, #5, #8)
+
+```python
+# backend/queue/service.py  (fragment)
+import logging
+import json
+from datetime import datetime
+from uuid import uuid4
+
+logger = logging.getLogger(__name__)
+
+
+async def process_queue_item(item_id: str, runner: ResearchRunner) -> None:
+    """Run research for one queue item.
+
+    Safe to run as a BackgroundTask. Injectable `runner` makes this
+    deterministically testable without hitting the real research engine.
+    """
+    item: QueueItem | None = None
+    claimed_run_id: str | None = None
+
+    try:
+        item = await repository.get(item_id)
+        if item is None:
+            logger.error("Queue item %s not found; discarding task", item_id)
+            return
+
+        # Claim the item: mint a fresh run_id, bump status.
+        # A subsequent regenerate will mint a different run_id, which lets
+        # us discard this run's result if we've been superseded.
+        claimed_run_id = str(uuid4())
+        item.active_run_id = claimed_run_id
+        item.status = DraftStatus.RESEARCHING
+        item.research_started_at = datetime.utcnow()
+        item.error_message = None
+        await repository.save(item)
+        await websocket_manager.broadcast_queue_update(item.id, item.status, item.updated_at)
+
+        # Heavy work — no DB session held here.
+        result = await runner.run(item.topic, style=item.style)
+
+        # Re-load and check we haven't been superseded.
+        fresh = await repository.get(item_id)
+        if fresh is None or fresh.active_run_id != claimed_run_id:
+            logger.warning(
+                "Run %s for item %s superseded before commit; discarding result",
+                claimed_run_id, item_id,
+            )
+            return
+
+        fresh.draft_md = result.report_markdown
+        fresh.sources_json = json.dumps(result.sources)
+        fresh.source_count = len(result.sources)
+        fresh.status = classify_draft(fresh.source_count)
+        await repository.save(fresh)
+        await websocket_manager.broadcast_queue_update(fresh.id, fresh.status, fresh.updated_at)
+
+    except Exception as exc:  # defensive boundary — must not kill the server
+        logger.exception("Research failed for item %s (run %s)", item_id, claimed_run_id)
+        # Only persist a failure if we loaded the item AND still own the run.
+        if item is None:
+            return
+        latest = await repository.get(item_id)
+        if latest is None or latest.active_run_id != claimed_run_id:
+            return  # superseded; don't stomp on the new run's state
+        latest.status = DraftStatus.FAILED
+        latest.error_message = str(exc)[:500]
+        await repository.save(latest)
+        await websocket_manager.broadcast_queue_update(latest.id, latest.status, latest.updated_at)
+```
+
+**Why this shape:**
+- `item` is `None`-initialized — the `except` block never references an unbound name (fix #2).
+- `claimed_run_id` is the compare-and-set token. A regenerate that arrives mid-run mints a new id; the old run's "I'm done, commit my result" step sees the mismatch and bails (fix #5).
+- Two `repository.save()` commits, not one — we persist the `researching` claim *before* the long await so a server crash leaves a recoverable stale row (see reconciliation below) rather than an invisible in-flight task (fix #1).
+- The `runner` parameter is a Protocol; production uses `GPTResearcherRunner`, tests use a `FakeRunner` that returns a canned `ResearchResult` (fix #8).
+
+### Approval Writes to the Brain (fix for finding #4, Option A)
+
+```python
+# backend/queue/service.py  (fragment)
+async def approve(item_id: str, *, override: bool = False) -> QueueItem:
+    item = await repository.require(item_id)
+
+    if item.status == DraftStatus.FLAGGED and not override:
+        raise InvalidStateTransition("Flagged drafts require override=true")
+    if item.status not in {DraftStatus.DRAFT_READY, DraftStatus.FLAGGED}:
+        raise InvalidStateTransition(f"Cannot approve from {item.status}")
+    if item.brain_path is not None:
+        raise InvalidStateTransition("Already approved and written to brain")
+
+    # Write to the brain exactly once, then mark approved.
+    sources = json.loads(item.sources_json) if item.sources_json else []
+    brain_path = save_research(
+        report_markdown=item.draft_md or "",
+        topic=item.topic,
+        sources=sources,
+        config={"queue_item_id": item.id, "approved_with_override": item.status == DraftStatus.FLAGGED and override},
+    )
+
+    item.brain_path = str(brain_path)
+    item.approved_at = datetime.utcnow()
+    item.approved_with_override = (item.status == DraftStatus.FLAGGED and override)
+    item.status = DraftStatus.APPROVED
+    await repository.save(item)
+    return item
+```
+
+**Key consequences of Option A (save-on-approval):**
+- Failed, rejected, and still-in-review research **never** lands in the brain. The brain stays a curated archive of approved content.
+- The existing hardcoded `status: "draft_ready"` in `brain/writer.py` is no longer a lie — approval is the trigger. (A later cleanup can switch the frontmatter to `status: "approved"` since that's always true for brain-written items.)
+- The CLI flow (`python cli.py ...`) continues to write directly to the brain with `status: "draft_ready"`, as today. The CLI is an unreviewed fast-path; the queue is reviewed. Both are valid surfaces, with different semantics documented in the brain's frontmatter.
+
+### Startup Reconciliation (fix for finding #1)
+
+```python
+# backend/queue/reconciliation.py (fragment)
+RECONCILE_TIMEOUT = timedelta(minutes=int(os.getenv("QUEUE_RECONCILE_MINUTES", "10")))
+
+async def reconcile_stale_runs() -> int:
+    """Called once at server startup. Marks abandoned runs as failed."""
+    cutoff = datetime.utcnow() - RECONCILE_TIMEOUT
+    stale = await repository.list_stale_researching(cutoff)
+    for item in stale:
+        item.status = DraftStatus.FAILED
+        item.error_message = "reconciled after server restart"
+        await repository.save(item)
+    return len(stale)
+```
+
+Wired into `backend/server/app.py` via an `on_event("startup")` or lifespan handler. A non-zero return is logged. Items can be recovered by the user via `POST /regenerate`.
 
 ## Frontend Specification
 
@@ -367,17 +537,22 @@ Extend `frontend/nextjs/`. This is a Next.js 14 app (App Router) packaged as the
 | `ApproveButton` | `frontend/nextjs/components/queue/ApproveButton.tsx` | Disabled-by-default for flagged drafts; override dialog on click |
 | `SubmitForm` | `frontend/nextjs/components/queue/SubmitForm.tsx` | Topic / style / destination inputs |
 
-### Components to Reuse
+### Components to Reuse (verified against `frontend/nextjs/components/` and `frontend/nextjs/helpers/`)
 
-⚠️ **COMPONENT_API risk — verify PropTypes/TypeScript interfaces of these before using:**
+The existing researcher UI is tightly coupled to the research flow and does **not** expose a shared design-system layer. Only the markdown helper is cleanly reusable.
 
-| Component | Expected Location | What we need from it |
-|---|---|---|
-| Button | `frontend/nextjs/components/` (TBD — verify) | Primary / destructive variants |
-| Markdown renderer | TBD — check `components/` for existing renderer | View mode for DraftEditor |
-| Form input wrappers | TBD — check existing researcher UI | Consistent styling |
+| Asset | Location | Kind | Use for |
+|---|---|---|---|
+| `markdownToHtml` | `frontend/nextjs/helpers/markdownHelper.ts` | Pure function | Rendering `draft_md` preview in `DraftEditor` view mode |
 
-**[TODO — read `frontend/nextjs/components/` during implementation before assuming these exist.]**
+**What does NOT exist (per directory inventory):**
+- No shared `Button` component — existing UI uses raw `<button>` with per-page Tailwind classes.
+- No shared markdown renderer component — the helper returns HTML; callers render it themselves.
+- No shared form wrappers — `Task/ResearchForm.tsx` and `ResearchBlocks/elements/InputArea.tsx` are purpose-built for the research UI and tightly coupled to its state.
+
+**Consequence:** the queue module owns its own primitives. Create queue-local `Button`, `Input`, and `StatusBadge` components under `frontend/nextjs/components/queue/`. Do **not** attempt to extract/generalize existing researcher UI for reuse in Phase 3 — that's a separate refactor, out of scope.
+
+**XSS note:** `draft_md` is LLM-generated content. When rendering the HTML output of `markdownToHtml`, sanitize with a library such as DOMPurify before mounting. Never ship a markdown preview that inserts raw HTML from an LLM without sanitization. Add this to the `DraftEditor` component's acceptance criteria.
 
 ### Hooks to Create
 
@@ -431,13 +606,19 @@ New module pattern (`backend/queue/`) doesn't mirror any existing code in this f
 
 ### ⚠️ MULTI_MODEL (medium-risk)
 
-Queue writes to two places per approval: the SQLite `queue_items` table AND the brain (via `save_research()`). These are independent (different stores, no transaction boundary). Design:
-- Brain write happens FIRST (inside `run_research`), then DB update commits the `brain_path`. If the DB write fails after the brain write succeeds, we have an orphan markdown file — the file has its own frontmatter and is still useful; the orphan is acceptable.
-- Approval does NOT write to the brain again; the brain copy is write-once at research time.
+Queue writes to two places on approval: the SQLite `queue_items` table AND the brain (via `save_research()`). These are independent (different stores, no transaction boundary). Design:
+- Brain write happens **only on approval** (Option A from the spec review). Research in progress, flagged drafts, rejected drafts, and failures never touch the brain.
+- Within `approve()`: brain write happens FIRST, then DB update sets `brain_path + approved_at + status=approved`. If the DB write fails after the brain write succeeds, we have an orphan markdown file and a still-`draft_ready` row. The orphan is self-describing (has frontmatter) and can be manually reconciled.
+- The `brain_path is not None` check in `approve()` prevents double-writes if a retry lands on an already-approved item.
 
 ### Concurrency / Race Conditions
 
-Single-user, single-process — race conditions unlikely. SQLite with `aiosqlite` serializes writes at the DB level. Defer connection pool tuning to if/when we go multi-user.
+Single-user, single-process — race conditions unlikely at the load level, but two realistic vectors exist and are addressed:
+
+- **Double-regenerate** (two tabs or double-click): handled by the `active_run_id` compare-and-set token. Only the most recent regenerate's run ID can commit a result; superseded runs log and discard.
+- **Server restart mid-research**: handled by startup reconciliation. Items in `researching` older than `QUEUE_RECONCILE_MINUTES` (default 10) are marked `failed` with `error_message="reconciled after server restart"`. User can `POST /regenerate` to retry.
+
+SQLite with `aiosqlite` serializes writes at the DB level. Defer connection pool tuning to if/when we go multi-user.
 
 ### Auth Model (Phase 3)
 
@@ -447,31 +628,68 @@ Server binds to `127.0.0.1:8000` — no token, no session, no password. Rational
 
 ## Acceptance Criteria
 
+### Backend — happy path
 - [ ] `POST /queue` with `{topic}` returns 201 and a QueueItem with `status=pending`
-- [ ] Within ~3 minutes, the same item's status reaches `draft_ready` OR `flagged` OR `failed`
-- [ ] `GET /queue` returns the item with its populated `draft_md`, `sources`, `source_count`
-- [ ] A draft with 0 real sources lands as `flagged`, not `draft_ready`
-- [ ] `POST /queue/{id}/approve` returns 409 for a `flagged` item when `override` is absent or false
-- [ ] `POST /queue/{id}/approve` with `override=true` transitions flagged → approved
-- [ ] `PUT /queue/{id}` updates `draft_md` in-place and bumps `updated_at`
-- [ ] `POST /queue/{id}/regenerate` resets the draft and re-runs research
-- [ ] WebSocket clients receive `queue_update` events for every status change
-- [ ] `/queue` page renders a list with filter tabs
+- [ ] Within a deterministic test (using a fake `ResearchRunner`), the same item's status transitions to `draft_ready` OR `flagged` OR `failed` synchronously
+- [ ] `GET /queue` returns the item with `draft_md`, `sources`, `source_count`
+- [ ] `GET /queue/stats` returns a dict of counts keyed by all 7 `DraftStatus` values
+
+### Backend — hallucination guard (fix #4, #5, #6, #8 testable)
+- [ ] A draft with `source_count < HALLUCINATION_MIN_SOURCES` lands as `flagged`, not `draft_ready`
+- [ ] `POST /approve` returns 409 for a `flagged` item when `override` is absent or false
+- [ ] `POST /approve` with `override=true` transitions `flagged` → `approved` and sets `approved_with_override=true`
+- [ ] `POST /approve` writes a new markdown file under `~/basic-memory/research/` and sets `brain_path`
+- [ ] A second `POST /approve` on an already-approved item returns 409 (brain never double-written)
+
+### Backend — immutability & durability (fix #1, #2, #3, #5)
+- [ ] `PUT /queue/{id}` on an `approved` item returns 409
+- [ ] Editing (`PUT`) a `draft_ready` or `flagged` draft bumps `updated_at`
+- [ ] `POST /regenerate` on an item currently in `pending` or `researching` returns 409
+- [ ] `POST /regenerate` on a `rejected` item returns 409
+- [ ] Two concurrent regenerate calls both may pass routing, but only the later one's `active_run_id` commits a result (first is discarded with a log line)
+- [ ] Items stuck in `researching` beyond `QUEUE_RECONCILE_MINUTES` transition to `failed` on next server startup with `error_message="reconciled after server restart"`
+- [ ] An exception inside `ResearchRunner.run()` is captured into `error_message` and results in `status=failed`; the server does not crash
+
+### Backend — brain integration
+- [ ] `failed`, `rejected`, and in-progress items never appear in `~/basic-memory/research/`
+- [ ] Approved items appear with full frontmatter (topic, sources, source_count, config snapshot)
+- [ ] Claude Desktop (after `basic-memory reindex`) can find approved drafts via its MCP tools
+
+### Frontend
+- [ ] `/queue` page renders a list with filter tabs and counts from `GET /queue/stats`
 - [ ] `/queue/[id]` renders a markdown editor, source list, and status-appropriate action buttons
+- [ ] `/queue/[id]` is read-only when `status == approved` (edit UI disabled with a visible reason)
 - [ ] Flagged drafts show the hallucination banner with source count and threshold
-- [ ] Existing CLI (`python cli.py ...`) still works unchanged
-- [ ] Approved drafts remain queryable in Claude Desktop via Basic Memory
+- [ ] Approve button for flagged drafts requires an explicit override confirmation dialog
+- [ ] `DraftEditor` preview sanitizes `markdownToHtml` output before rendering (XSS guard)
+- [ ] On WS reconnect, the UI calls `GET /queue` (and `GET /queue/{id}` if a detail page is open) to re-sync
+
+### Compatibility
+- [ ] Existing CLI (`python cli.py ...`) still works unchanged; CLI-written notes continue to land in the brain with `status: draft_ready` frontmatter (unreviewed fast-path semantics)
 
 ## Resolved Decisions
 
-All pre-implementation questions have been answered. Decisions captured here for traceability — each one is reflected in the sections above.
+All pre-implementation questions and Codex review findings have been answered. Decisions captured here for traceability — each one is reflected in the sections above.
+
+### Pre-Implementation Q&A
 
 1. **ORM:** Raw SQLAlchemy 2.0 + separate Pydantic schemas. Two class sets with explicit mappers. Reflected in `backend/queue/` module layout, model fragment, schema fragment.
 2. **Hallucination threshold:** `HALLUCINATION_MIN_SOURCES=3`, tunable via env var.
-3. **CLI + queue coexist.** Both call `save_research()`; the brain is identical regardless of source. CLI is not rewritten.
+3. **CLI + queue coexist.** CLI writes directly to brain with `draft_ready` (unreviewed fast-path). Queue writes to brain only on approval (reviewed path). Both are valid surfaces with different semantics.
 4. **`GET /queue/stats` included** — returns a dict of counts per status.
 5. **Rejection is terminal.** Retry = submit a new queue item. Regenerate endpoint explicitly refuses `rejected` items.
 6. **Auth Phase 3:** bind to `127.0.0.1`, no auth. Upgrade to `QUEUE_API_TOKEN` bearer token in Phase 5 when publishing adapters go live.
+
+### Codex Adversarial Review (fold-in)
+
+7. **Option A for brain integration** — brain is written **only on approval**, never during research. Failed/rejected/in-progress research never lands on disk. Eliminates the divergence between hardcoded `status: "draft_ready"` frontmatter and queue truth.
+8. **Durability:** `research_started_at` + startup `reconcile_stale_runs()` scan transitions abandoned `researching` rows to `failed`. `QUEUE_RECONCILE_MINUTES` env var (default 10).
+9. **Safe run sketch:** `item: QueueItem | None = None` at function start; guarded mutations in `except`/`finally`; re-load before commit to detect supersession.
+10. **Approved is immutable:** `PUT /queue/{id}` rejects when `status == approved`. To amend, submit a new queue item.
+11. **Regenerate atomicity:** `active_run_id` compare-and-set. Regenerate mints a new UUID; in-flight runs check their run ID before committing and discard if superseded. Regenerate refuses `pending`, `researching`, `approved`, `rejected`.
+12. **WS contract:** delta stream only. Clients must `GET /queue` on (re)connect to sync; `updated_at` in deltas lets clients detect out-of-order delivery.
+13. **Frontend reuse reality:** only `markdownToHtml` helper is genuinely reusable. Queue owns its own `Button`, `Input`, `StatusBadge` primitives. DraftEditor preview sanitizes rendered HTML.
+14. **Test seam:** `process_queue_item(id, runner: ResearchRunner)` service entry point is injectable. Production uses `GPTResearcherRunner`; tests use a fake runner for deterministic synchronous assertions — no polling, no timeouts, no flakiness.
 
 ## Completeness
 
@@ -479,18 +697,18 @@ All pre-implementation questions have been answered. Decisions captured here for
 |---|---|
 | Summary + Goals + Scope | ✅ Complete |
 | Backend: models, routes, state machine | ✅ Complete |
-| Backend: service and task code sketch | ✅ Complete |
-| Frontend: pages, components, hooks | ⚠️ Partial — reused component APIs marked [TODO] pending codebase read |
-| API contract (request/response shapes) | ✅ Complete |
-| Risk flags | ✅ Complete |
-| Acceptance criteria | ✅ 13 items |
-| Decisions resolved | ✅ All 6 pre-implementation questions answered |
+| Backend: service, runner protocol, reconciliation | ✅ Complete |
+| Frontend: pages, components, hooks | ✅ Complete — reuse table verified against actual `frontend/nextjs/components/` inventory |
+| API contract (request/response shapes) | ✅ Complete (WS reconnection contract added) |
+| Risk flags | ✅ Complete (MULTI_MODEL updated for save-on-approval) |
+| Acceptance criteria | ✅ 23 items across backend, frontend, compatibility |
+| Decisions resolved | ✅ All 6 pre-implementation Q&A + all 8 Codex review findings folded in |
 
-Spec is **ready for `/spec-review`**. The remaining [TODO] items are intentional — they're questions to answer by reading `frontend/nextjs/components/` during implementation, not decisions to make at spec time.
+Spec is **ready for `/spec-review`**. Every open question has a documented answer; every known risk has a named mitigation; every ambiguity has an acceptance-criterion test.
 
 ---
 
 **Next Steps:**
-1. `/spec-review docs/features/phase-3-approval-queue.md` — generates GitHub issues per section (expect ~5–7 issues: DB setup, models+schemas, routes, state machine + guard, background task, frontend pages, frontend components)
+1. `/spec-review docs/features/phase-3-approval-queue.md` — generates GitHub issues per section (expect ~7–9 issues now: DB setup + reconciliation, models + schemas + mappers, runner protocol + service, router + state machine + guard, approval + brain integration, frontend queue list + stats, frontend detail + editor + XSS sanitization, frontend WS + refetch)
 2. `/orchestrate <issue-number>` per issue
 3. Independent issues can run in parallel (`--parallel` flag)
